@@ -1,0 +1,619 @@
+# Advanced Monitoring Patterns & Production Recipes
+
+## Production-Ready Monitoring Strategies
+
+### Pattern 1: Gradual Threshold Escalation
+
+Monitor resource usage with progressive alerts:
+
+```yaml
+# Step 1: Warning (yellow) - notify but don't act
+CPU > 60% for 10 minutes → Email alert (LOW PRIORITY)
+
+# Step 2: Critical (red) - notify and prepare escalation  
+CPU > 80% for 5 minutes → Email + Slack alert (HIGH PRIORITY)
+
+# Step 3: Emergency (escalate)
+CPU > 95% for 2 minutes → PagerDuty page on-call engineer
+```
+
+**Implementation:**
+
+```bash
+# Warning alarm
+aws cloudwatch put-metric-alarm \
+  --alarm-name prod-cpu-warning \
+  --metric-name CPUUtilization \
+  --namespace AWS/EC2 \
+  --statistic Average \
+  --period 600 \
+  --evaluation-periods 1 \
+  --threshold 60 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:region:account:low-priority-topic
+
+# Critical alarm
+aws cloudwatch put-metric-alarm \
+  --alarm-name prod-cpu-critical \
+  --metric-name CPUUtilization \
+  --namespace AWS/EC2 \
+  --statistic Average \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 80 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:region:account:high-priority-topic
+
+# Emergency escalation via Lambda trigger
+```
+
+---
+
+### Pattern 2: Anomaly Detection (ML-based)
+
+Use CloudWatch Anomaly Detection for intelligent alerting:
+
+```bash
+# Create anomaly detector
+aws cloudwatch put-metric-alarm \
+  --alarm-name prod-cpu-anomaly \
+  --comparison-operator LessThanLowerOrGreaterThanUpperThreshold \
+  --evaluation-periods 2 \
+  --metrics '[{
+    "Id": "e1",
+    "Expression": "ANOMALY_DETECTOR(m1, 2)",
+    "ReturnData": true
+  },
+  {
+    "Id": "m1",
+    "ReturnData": true,
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/EC2",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [{"Name": "InstanceId", "Value": "i-xxxxx"}]
+      },
+      "Period": 300,
+      "Stat": "Average"
+    }
+  }]' \
+  --threshold-metric-id e1 \
+  --alarm-actions arn:aws:sns:region:account:topic
+```
+
+**Advantages:**
+- Detects unusual patterns (not just static thresholds)
+- Self-learns baseline behavior
+- Reduces false positives
+- Catches gradual degradation
+
+---
+
+### Pattern 3: Composite Health Monitoring
+
+Create dashboard showing overall instance health:
+
+```python
+import boto3
+import json
+from datetime import datetime, timedelta
+
+cloudwatch = boto3.client('cloudwatch')
+
+def create_health_dashboard(instance_id):
+    """Create comprehensive health dashboard"""
+    
+    dashboard = {
+        "widgets": [
+            {
+                "type": "metric",
+                "properties": {
+                    "metrics": [
+                        ["AWS/EC2", "CPUUtilization", {"stat": "Average"}],
+                        ["EC2/Monitoring", "MEM_USED_PERCENT", {"stat": "Average"}],
+                        ["EC2/Monitoring", "DISK_USED_PERCENT", {"stat": "Average"}]
+                    ],
+                    "period": 300,
+                    "stat": "Average",
+                    "region": "us-east-1",
+                    "title": "Instance Health Metrics",
+                    "dimensions": {
+                        "InstanceId": instance_id
+                    }
+                }
+            },
+            {
+                "type": "metric",
+                "properties": {
+                    "metrics": [
+                        ["AWS/EC2", "StatusCheckFailed_Instance"],
+                        ["AWS/EC2", "StatusCheckFailed_System"]
+                    ],
+                    "period": 60,
+                    "stat": "Sum",
+                    "region": "us-east-1",
+                    "title": "Status Checks",
+                    "dimensions": {
+                        "InstanceId": instance_id
+                    }
+                }
+            }
+        ]
+    }
+    
+    # Create dashboard
+    cloudwatch.put_dashboard(
+        DashboardName=f"Instance-{instance_id}-Health",
+        DashboardBody=json.dumps(dashboard)
+    )
+    
+    print(f"Dashboard created for {instance_id}")
+
+# Usage
+create_health_dashboard("i-1234567890abcdef0")
+```
+
+---
+
+### Pattern 4: Cost-Aware Monitoring
+
+Track actual costs per instance:
+
+```python
+def calculate_instance_cost(instance_type, hours_running, region="us-east-1"):
+    """Calculate cost for instance"""
+    
+    pricing = {
+        "us-east-1": {
+            "t3.small": 0.0104,      # per hour
+            "t3.medium": 0.0416,
+            "t3.large": 0.0832,
+            "m6i.large": 0.096,
+        }
+    }
+    
+    hourly_rate = pricing[region][instance_type]
+    total_cost = hourly_rate * hours_running
+    
+    # Add storage costs (~$0.10 per GB-month)
+    storage_gb = 100
+    monthly_storage = (storage_gb * 0.10) / 730  # per hour
+    total_cost += monthly_storage * hours_running
+    
+    # Add data transfer (if any)
+    total_cost += 0.01  # rough estimate per hour
+    
+    return {
+        "hourly_cost": hourly_rate,
+        "total_cost": total_cost,
+        "storage_hourly": monthly_storage,
+        "data_transfer_estimated": 0.01
+    }
+
+# Create custom metric for cost
+def publish_cost_metric(instance_id, instance_type):
+    cloudwatch = boto3.client('cloudwatch')
+    cost = calculate_instance_cost(instance_type, 1)
+    
+    cloudwatch.put_metric_data(
+        Namespace='EC2/Cost',
+        MetricData=[
+            {
+                'MetricName': 'HourlyEstimatedCost',
+                'Value': cost['total_cost'],
+                'Unit': 'None',
+                'Dimensions': [
+                    {'Name': 'InstanceId', 'Value': instance_id},
+                    {'Name': 'InstanceType', 'Value': instance_type}
+                ]
+            }
+        ]
+    )
+```
+
+---
+
+### Pattern 5: Predictive Scaling
+
+Use historical metrics to predict when to scale:
+
+```python
+import numpy as np
+from datetime import datetime, timedelta
+
+def predict_scaling_need(metric_values, threshold=80, hours_ahead=1):
+    """
+    Predict if instance will exceed threshold within N hours
+    
+    Args:
+        metric_values: list of recent values (last 24 hours)
+        threshold: alarm threshold
+        hours_ahead: hours to predict into future
+    """
+    
+    # Fit polynomial to historical data
+    x = np.arange(len(metric_values))
+    y = np.array(metric_values)
+    
+    # Fit degree 2 polynomial
+    coeffs = np.polyfit(x, y, 2)
+    poly = np.poly1d(coeffs)
+    
+    # Predict value N hours ahead (assuming 5-min intervals)
+    future_idx = len(metric_values) + (hours_ahead * 12)
+    predicted_value = poly(future_idx)
+    
+    return {
+        "predicted_value": predicted_value,
+        "will_exceed": predicted_value > threshold,
+        "recommendation": "scale_up" if predicted_value > threshold else "maintain"
+    }
+
+# Usage with real metrics
+def check_scaling_prediction(instance_id, metric_name):
+    cloudwatch = boto3.client('cloudwatch')
+    
+    # Get historical metrics
+    response = cloudwatch.get_metric_statistics(
+        Namespace='EC2/Monitoring',
+        MetricName=metric_name,
+        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+        StartTime=datetime.utcnow() - timedelta(hours=24),
+        EndTime=datetime.utcnow(),
+        Period=300,
+        Statistics=['Average']
+    )
+    
+    values = [point['Average'] for point in sorted(response['Datapoints'], key=lambda x: x['Timestamp'])]
+    prediction = predict_scaling_need(values, threshold=80, hours_ahead=1)
+    
+    print(f"Predicted {metric_name}: {prediction['predicted_value']:.2f}%")
+    print(f"Recommendation: {prediction['recommendation']}")
+    
+    return prediction
+```
+
+---
+
+### Pattern 6: Multi-Region Monitoring
+
+Monitor instances across regions with central dashboard:
+
+```python
+import boto3
+
+def create_cross_region_alarm(instance_details):
+    """
+    Create alarms across multiple regions
+    
+    Args:
+        instance_details: [
+            {"instance_id": "i-xxxxx", "region": "us-east-1"},
+            {"instance_id": "i-yyyyy", "region": "eu-west-1"}
+        ]
+    """
+    
+    for instance in instance_details:
+        region = instance['region']
+        instance_id = instance['instance_id']
+        
+        cloudwatch = boto3.client('cloudwatch', region_name=region)
+        
+        # Create alarm in each region
+        cloudwatch.put_metric_alarm(
+            AlarmName=f"global-cpu-{instance_id}",
+            MetricName='CPUUtilization',
+            Namespace='AWS/EC2',
+            Statistic='Average',
+            Period=300,
+            EvaluationPeriods=2,
+            Threshold=80,
+            ComparisonOperator='GreaterThanThreshold',
+            Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+            AlarmActions=[f"arn:aws:sns:{region}:ACCOUNT:global-alarms"]
+        )
+
+# Create aggregated SNS topic
+def create_global_sns_topic(regions):
+    """Create SNS topics in each region and consolidate"""
+    
+    sns_topics = {}
+    
+    for region in regions:
+        sns = boto3.client('sns', region_name=region)
+        topic = sns.create_topic(Name='global-alarms')
+        sns_topics[region] = topic['TopicArn']
+    
+    # Subscribe all topics to central SQS/EventBridge
+    # This creates a fan-out pattern for cross-region monitoring
+    
+    return sns_topics
+```
+
+---
+
+### Pattern 7: Application-Specific Metrics
+
+Instrument your application to send custom metrics:
+
+```python
+import boto3
+import time
+
+class ApplicationMetrics:
+    def __init__(self, instance_id):
+        self.cloudwatch = boto3.client('cloudwatch')
+        self.instance_id = instance_id
+    
+    def publish_request_count(self, count, endpoint):
+        """Track API requests"""
+        self.cloudwatch.put_metric_data(
+            Namespace='MyApp/Performance',
+            MetricData=[{
+                'MetricName': 'RequestCount',
+                'Value': count,
+                'Unit': 'Count',
+                'Dimensions': [
+                    {'Name': 'InstanceId', 'Value': self.instance_id},
+                    {'Name': 'Endpoint', 'Value': endpoint}
+                ]
+            }]
+        )
+    
+    def publish_response_time(self, milliseconds, endpoint):
+        """Track API response times"""
+        self.cloudwatch.put_metric_data(
+            Namespace='MyApp/Performance',
+            MetricData=[{
+                'MetricName': 'ResponseTime',
+                'Value': milliseconds,
+                'Unit': 'Milliseconds',
+                'Dimensions': [
+                    {'Name': 'InstanceId', 'Value': self.instance_id},
+                    {'Name': 'Endpoint', 'Value': endpoint}
+                ]
+            }]
+        )
+    
+    def publish_error_count(self, count, error_type):
+        """Track errors"""
+        self.cloudwatch.put_metric_data(
+            Namespace='MyApp/Errors',
+            MetricData=[{
+                'MetricName': 'ErrorCount',
+                'Value': count,
+                'Unit': 'Count',
+                'Dimensions': [
+                    {'Name': 'InstanceId', 'Value': self.instance_id},
+                    {'Name': 'ErrorType', 'Value': error_type}
+                ]
+            }]
+        )
+
+# Usage in your Flask/Django app
+from flask import Flask, request, g
+from time import time
+
+app = Flask(__name__)
+metrics = ApplicationMetrics("i-1234567890abcdef0")
+
+@app.before_request
+def before_request():
+    g.start_time = time()
+
+@app.after_request
+def after_request(response):
+    duration = (time() - g.start_time) * 1000  # Convert to ms
+    
+    # Publish metrics
+    metrics.publish_response_time(duration, request.endpoint)
+    
+    if response.status_code >= 400:
+        metrics.publish_error_count(1, f"HTTP{response.status_code}")
+    
+    return response
+
+@app.route('/api/users', methods=['GET'])
+def get_users():
+    metrics.publish_request_count(1, 'get_users')
+    # ... your code ...
+    return {"users": []}
+```
+
+---
+
+### Pattern 8: Automated Remediation
+
+Auto-fix common issues before alerting:
+
+```python
+import boto3
+import subprocess
+
+class AutoRemediation:
+    def __init__(self, instance_id, region='us-east-1'):
+        self.instance_id = instance_id
+        self.ec2 = boto3.client('ec2', region_name=region)
+        self.ssm = boto3.client('ssm', region_name=region)
+    
+    def restart_service_on_high_memory(self, threshold=85):
+        """Restart service if memory too high"""
+        # Get memory usage
+        response = self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'command': ['free | grep Mem | awk "{print int($3/$2 * 100)}"']}
+        )
+        
+        # Check if memory > threshold
+        # If yes, restart service
+        command = "systemctl restart myapp"
+        self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'command': [command]}
+        )
+    
+    def cleanup_disk_space(self, threshold=85):
+        """Clean old logs if disk usage high"""
+        cleanup_commands = [
+            "find /var/log -type f -mtime +30 -delete",  # Delete logs > 30 days
+            "journalctl --vacuum=30d",                    # Trim journal logs
+            "apt-get autoclean && apt-get autoremove"     # Clean package manager
+        ]
+        
+        self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'command': cleanup_commands}
+        )
+    
+    def kill_zombie_processes(self):
+        """Kill zombie processes consuming memory"""
+        # Find zombies
+        find_cmd = "ps aux | grep defunct | wc -l"
+        
+        # Kill parent process to clean zombies
+        kill_cmd = "ps aux | grep defunct | grep -v grep | awk '{print $3}' | xargs kill -9"
+        
+        self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'command': [kill_cmd]}
+        )
+    
+    def rotate_application_logs(self):
+        """Force rotation if logs fill disk"""
+        self.ssm.send_command(
+            InstanceIds=[self.instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'command': ['logrotate -f /etc/logrotate.conf']}
+        )
+
+# Lambda function to trigger remediation
+def lambda_handler(event, context):
+    """Triggered by CloudWatch alarm"""
+    
+    # Parse SNS message
+    message = json.loads(event['Records'][0]['Sns']['Message'])
+    alarm_name = message['AlarmName']
+    instance_id = message['Trigger']['Dimensions'][0]['value']
+    
+    remediation = AutoRemediation(instance_id)
+    
+    # Auto-remediate based on alarm type
+    if 'memory' in alarm_name.lower():
+        remediation.restart_service_on_high_memory()
+    elif 'disk' in alarm_name.lower():
+        remediation.cleanup_disk_space()
+    
+    # Still send notification to team
+    notify_team(f"Auto-remediation triggered for {alarm_name}")
+```
+
+---
+
+### Pattern 9: Dashboard Template
+
+Pre-built comprehensive monitoring dashboard:
+
+```json
+{
+  "DashboardName": "EC2-Production-Monitoring",
+  "DashboardBody": {
+    "widgets": [
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/EC2", "CPUUtilization", {"stat": "Average"}],
+            [".", ".", {"stat": "Maximum"}],
+            ["EC2/Monitoring", "MEM_USED_PERCENT", {"stat": "Average"}],
+            [".", "DISK_USED_PERCENT", {"stat": "Average"}]
+          ],
+          "period": 300,
+          "stat": "Average",
+          "region": "us-east-1",
+          "title": "Instance Health Overview",
+          "yAxis": {"left": {"min": 0, "max": 100}},
+          "annotations": {
+            "horizontal": [
+              {"label": "CPU Alarm", "value": 80},
+              {"label": "Memory Alarm", "value": 85},
+              {"label": "Disk Alarm", "value": 80}
+            ]
+          }
+        }
+      },
+      {
+        "type": "log",
+        "properties": {
+          "query": "fields @timestamp, @message | filter @message like /ERROR/ | stats count() by bin(5m)",
+          "region": "us-east-1",
+          "title": "Error Rate (5-min)",
+          "queryString": "fields @timestamp, @message"
+        }
+      },
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/EC2", "StatusCheckFailed_Instance"],
+            [".", "StatusCheckFailed_System"]
+          ],
+          "period": 60,
+          "stat": "Sum",
+          "region": "us-east-1",
+          "title": "Status Checks (Failures)"
+        }
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Monitoring Checklist for Production
+
+- [ ] All 5 core alarms configured (CPU, Memory, Disk, Status checks)
+- [ ] SNS subscriptions confirmed and tested
+- [ ] Auto-recovery enabled for system failures
+- [ ] CloudWatch Agent verified and logging metrics
+- [ ] Log retention policies set (7-30 days)
+- [ ] CloudWatch dashboard created
+- [ ] Team access via IAM roles configured
+- [ ] Alarm thresholds tuned to your baseline
+- [ ] Runbooks created for each alarm type
+- [ ] On-call rotation configured in PagerDuty/OpsGenie
+- [ ] Cost alerts configured
+- [ ] Weekly alarm review scheduled
+
+---
+
+## Production Deployment Checklist
+
+```bash
+# Pre-launch validation
+./validate-template.sh
+
+# Performance baseline (run for 7 days)
+./baseline-metrics.sh
+
+# Tune thresholds
+./tune-alarms.sh
+
+# Team training
+./schedule-team-training.sh
+
+# Go-live
+./launch-production.sh
+
+# Post-launch monitoring (first 24 hours)
+./monitor-launch.sh
+```
+
+---
+
+**Last Updated**: November 2025
+**For Production Use**: Follow all checklist items before deploying to production

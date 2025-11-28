@@ -1,0 +1,618 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Service Catalog EC2 Product with Comprehensive CloudWatch Monitoring and Alarms'
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: prod-app-server
+    Description: Name of the EC2 instance
+    MinLength: 1
+    MaxLength: 255
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m6i.large
+      - m6i.xlarge
+      - c6i.large
+      - c6i.xlarge
+
+  LatestAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where EC2 instance will be launched
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for instance launch (should be in the selected VPC)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for the instance
+
+  EbsVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: Root EBS volume size in GB
+
+  EbsVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+      - io2
+    Description: EBS volume type for root volume
+
+  EnvironmentTag:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment tag for resource organization
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation
+
+  SNSTopicArn:
+    Type: String
+    Description: SNS Topic ARN for alarm notifications
+    AllowedPattern: arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[a-zA-Z0-9_-]+
+
+  CpuAlarmThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 20
+    MaxValue: 100
+    Description: CPU utilization threshold percentage for alarm
+
+  MemoryAlarmThreshold:
+    Type: Number
+    Default: 85
+    MinValue: 20
+    MaxValue: 100
+    Description: Memory utilization threshold percentage for alarm
+
+  DiskAlarmThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 20
+    MaxValue: 95
+    Description: Disk usage threshold percentage for alarm
+
+  EnableAutoRecovery:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable automatic recovery on system status check failure
+
+  TagKey:
+    Type: String
+    Default: ManagedBy
+    Description: Tag key for resource management
+
+  TagValue:
+    Type: String
+    Default: ServiceCatalog
+    Description: Tag value indicating resource source
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceName
+          - InstanceType
+          - LatestAmiId
+          - EbsVolumeSize
+          - EbsVolumeType
+          - KeyName
+
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId
+          - SecurityGroupId
+
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - SNSTopicArn
+          - CpuAlarmThreshold
+          - MemoryAlarmThreshold
+          - DiskAlarmThreshold
+          - EnableAutoRecovery
+
+      - Label:
+          default: "Tagging and Organization"
+        Parameters:
+          - EnvironmentTag
+          - CostCenter
+          - TagKey
+          - TagValue
+
+Resources:
+
+  # =====================================================================
+  # IAM Role for EC2 Instance to write metrics to CloudWatch
+  # =====================================================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ec2-cloudwatch-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # =====================================================================
+  # EC2 Instance
+  # =====================================================================
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: !Ref EbsVolumeType
+            VolumeSize: !Ref EbsVolumeSize
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      Monitoring: true
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Update system packages
+          yum update -y
+          
+          # Download and install CloudWatch Agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          # Create CloudWatch Agent configuration
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'CWCONFIG'
+          {
+            "agent": {
+              "metrics_collection_interval": 60,
+              "run_as_user": "cwagent"
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/messages",
+                      "log_group_name": "/aws/ec2/${InstanceName}/system",
+                      "log_stream_name": "{instance_id}",
+                      "retention_in_days": 7
+                    },
+                    {
+                      "file_path": "/var/log/secure",
+                      "log_group_name": "/aws/ec2/${InstanceName}/auth",
+                      "log_stream_name": "{instance_id}",
+                      "retention_in_days": 7
+                    }
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "namespace": "EC2/Monitoring",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    {
+                      "name": "cpu_usage_idle",
+                      "rename": "CPU_IDLE",
+                      "unit": "Percent"
+                    },
+                    {
+                      "name": "cpu_usage_iowait",
+                      "rename": "CPU_IOWAIT",
+                      "unit": "Percent"
+                    },
+                    "cpu_time_guest"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "totalcpu": true
+                },
+                "disk": {
+                  "measurement": [
+                    {
+                      "name": "used_percent",
+                      "rename": "DISK_USED_PERCENT",
+                      "unit": "Percent"
+                    },
+                    {
+                      "name": "free",
+                      "rename": "DISK_FREE",
+                      "unit": "Gigabytes"
+                    }
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    {
+                      "name": "mem_used_percent",
+                      "rename": "MEM_USED_PERCENT",
+                      "unit": "Percent"
+                    },
+                    {
+                      "name": "mem_available",
+                      "rename": "MEM_AVAILABLE",
+                      "unit": "Megabytes"
+                    },
+                    "mem_used"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "netstat": {
+                  "measurement": [
+                    {
+                      "name": "tcp_established",
+                      "rename": "TCP_ESTABLISHED",
+                      "unit": "Count"
+                    },
+                    {
+                      "name": "tcp_time_wait",
+                      "rename": "TCP_TIME_WAIT",
+                      "unit": "Count"
+                    }
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "statsd": {
+                  "service_address": ":8125",
+                  "metrics_collection_interval": 10,
+                  "metrics_aggregation_interval": 60
+                }
+              }
+            }
+          }
+          CWCONFIG
+
+          # Fetch the configuration using SSM Parameter Store if exists
+          # Otherwise use local config
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a query \
+            -m ec2 \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json \
+            -s || true
+
+          # Start CloudWatch Agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config \
+            -m ec2 \
+            -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+
+          # Signal success to CloudFormation
+          echo "CloudWatch Agent installation completed"
+
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Alarms - CPU Utilization
+  # =====================================================================
+  CPUHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-cpu-utilization-high'
+      AlarmDescription: !Sub 'Alert when CPU utilization exceeds ${CpuAlarmThreshold}% on ${InstanceName}'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Alarms - Memory Utilization (Custom Metric)
+  # =====================================================================
+  MemoryHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-memory-utilization-high'
+      AlarmDescription: !Sub 'Alert when memory utilization exceeds ${MemoryAlarmThreshold}% on ${InstanceName}'
+      MetricName: MEM_USED_PERCENT
+      Namespace: EC2/Monitoring
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MemoryAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Alarms - Disk Usage
+  # =====================================================================
+  DiskUsageHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-disk-usage-high'
+      AlarmDescription: !Sub 'Alert when disk usage exceeds ${DiskAlarmThreshold}% on ${InstanceName}'
+      MetricName: DISK_USED_PERCENT
+      Namespace: EC2/Monitoring
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref DiskAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+        - Name: path
+          Value: /
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Alarms - Status Checks
+  # =====================================================================
+  InstanceStatusCheckFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-status-check-failed-instance'
+      AlarmDescription: !Sub 'Alert when instance status check fails on ${InstanceName}'
+      MetricName: StatusCheckFailed_Instance
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  SystemStatusCheckFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-status-check-failed-system'
+      AlarmDescription: !Sub 'Alert when system status check fails on ${InstanceName}'
+      MetricName: StatusCheckFailed_System
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Alarms - Network Errors
+  # =====================================================================
+  NetworkErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${InstanceName}-network-errors'
+      AlarmDescription: !Sub 'Alert when network errors detected on ${InstanceName}'
+      MetricName: NetworkPacketsIn
+      Namespace: AWS/EC2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # Auto Recovery (if enabled)
+  # =====================================================================
+  AutoRecoveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAutoRecoveryCondition
+    Properties:
+      AlarmName: !Sub '${InstanceName}-auto-recovery'
+      AlarmDescription: !Sub 'Auto-recovery alarm for ${InstanceName} - recovers instance on system status check failure'
+      MetricName: StatusCheckFailed_System
+      Namespace: AWS/EC2
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Sub 'arn:aws:automate:${AWS::Region}:ec2:recover'
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  # =====================================================================
+  # CloudWatch Log Group for System Logs
+  # =====================================================================
+  SystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${InstanceName}/system'
+      RetentionInDays: 7
+
+  AuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${InstanceName}/auth'
+      RetentionInDays: 7
+
+Conditions:
+  EnableAutoRecoveryCondition: !Equals [!Ref EnableAutoRecovery, 'true']
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePrivateIp:
+    Description: Private IP address of the instance
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIp'
+
+  InstancePublicIp:
+    Description: Public IP address of the instance (if available)
+    Value: !GetAtt EC2Instance.PublicIp
+    Condition: HasPublicIp
+
+  CloudWatchNamespace:
+    Description: CloudWatch namespace for custom metrics
+    Value: EC2/Monitoring
+    Export:
+      Name: !Sub '${AWS::StackName}-Namespace'
+
+  SystemLogGroupName:
+    Description: CloudWatch Log Group for system logs
+    Value: !Ref SystemLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemLogs'
+
+  CPUAlarmName:
+    Description: CPU Utilization Alarm Name
+    Value: !Ref CPUHighAlarm
+
+  MemoryAlarmName:
+    Description: Memory Utilization Alarm Name
+    Value: !Ref MemoryHighAlarm
+
+  DiskAlarmName:
+    Description: Disk Usage Alarm Name
+    Value: !Ref DiskUsageHighAlarm
+
+  InstanceStatusAlarmName:
+    Description: Instance Status Check Alarm Name
+    Value: !Ref InstanceStatusCheckFailedAlarm
+
+  SystemStatusAlarmName:
+    Description: System Status Check Alarm Name
+    Value: !Ref SystemStatusCheckFailedAlarm
+
+  MonitoringDashboardUrl:
+    Description: URL to CloudWatch Dashboard for this instance
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for notifications
+    Value: !Ref SNSTopicArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+# Placeholder for future condition
+Conditions:
+  HasPublicIp: !Not [!Equals [!GetAtt EC2Instance.PublicIp, '']]

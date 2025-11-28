@@ -1,0 +1,757 @@
+# AWS Service Catalog EC2 Product - Complete Deployment Guide
+
+## Table of Contents
+1. [Overview](#overview)
+2. [Prerequisites](#prerequisites)
+3. [Architecture](#architecture)
+4. [Step-by-Step Deployment](#deployment)
+5. [Testing & Validation](#testing)
+6. [Monitoring & Troubleshooting](#troubleshooting)
+7. [Advanced Configuration](#advanced)
+8. [Cost Optimization](#costs)
+
+---
+
+## Overview
+
+This solution provides a **production-ready AWS Service Catalog product** that enables self-service EC2 instance provisioning with:
+
+✅ **Comprehensive Monitoring**
+- CPU Utilization tracking
+- Memory utilization (requires CloudWatch Agent)
+- Disk usage monitoring
+- System and instance status checks
+- Network performance metrics
+
+✅ **Automated Alerting**
+- CloudWatch Alarms for each metric
+- SNS notifications to email/SMS
+- Configurable thresholds
+- Auto-recovery on system failures
+
+✅ **Enterprise Features**
+- IAM-based access control
+- Resource tagging strategy
+- Cost allocation tags
+- Centralized logging
+- Auto-scaling ready
+
+---
+
+## Prerequisites
+
+### AWS Account Requirements
+- AWS Account with appropriate permissions
+- Minimum IAM Role: EC2, CloudFormation, CloudWatch, SNS, IAM, Service Catalog
+- Recommended: Administrator or PowerUser role for initial setup
+
+### AWS Resources
+- VPC with at least one subnet
+- Security Group configured for your needs
+- EC2 Key Pair for SSH access
+- S3 Bucket (will be created if needed)
+
+### Permissions Checklist
+```
+[✓] ec2:*
+[✓] cloudformation:*
+[✓] servicecatalog:*
+[✓] iam:*
+[✓] cloudwatch:*
+[✓] sns:*
+[✓] s3:*
+[✓] logs:*
+```
+
+### Local Setup
+```bash
+# Required tools
+aws --version          # AWS CLI v2.x or higher
+jq --version          # JSON processor (optional)
+curl --version        # For testing
+
+# Configure AWS CLI
+aws configure
+aws sts get-caller-identity  # Verify credentials
+```
+
+---
+
+## Architecture
+
+### Solution Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     AWS SERVICE CATALOG                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  User selects "EC2 with Monitoring" product                 │
+│           ↓                                                   │
+│  Provides parameters (Instance Type, VPC, etc.)             │
+│           ↓                                                   │
+│  CloudFormation creates stack                               │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+        ┌──────────────────────────────────────┐
+        │      CLOUDFORMATION STACK            │
+        ├──────────────────────────────────────┤
+        │                                      │
+        │  ┌─ EC2 Instance (t3.medium, etc)  │
+        │  ├─ IAM Role + Instance Profile    │
+        │  ├─ Security Group Rules           │
+        │  └─ EBS Volume (GP3 100GB)         │
+        │                                      │
+        │  ┌─ CloudWatch Agent               │
+        │  │  (installed via UserData)       │
+        │  └─ Custom Metrics Namespace       │
+        │                                      │
+        │  ┌─ CloudWatch Alarms              │
+        │  │  ├─ CPU High (80%)              │
+        │  │  ├─ Memory High (85%)           │
+        │  │  ├─ Disk Usage High (80%)       │
+        │  │  ├─ Status Check Failed         │
+        │  │  └─ Network Errors              │
+        │  └─ Auto-Recovery (optional)       │
+        │                                      │
+        │  ┌─ SNS Topic                      │
+        │  │  └─ Email Notifications         │
+        │  └─ CloudWatch Log Groups          │
+        │                                      │
+        └──────────────────────────────────────┘
+                           ↓
+        ┌──────────────────────────────────────┐
+        │      USER MONITORING EXPERIENCE      │
+        ├──────────────────────────────────────┤
+        │                                      │
+        │  Email Alert (SNS):                 │
+        │  "CPU utilization is 92% on         │
+        │   prod-app-server"                  │
+        │                                      │
+        │  CloudWatch Dashboard:              │
+        │  Real-time metrics visualization    │
+        │                                      │
+        │  CloudWatch Logs:                   │
+        │  System and auth logs aggregation   │
+        │                                      │
+        └──────────────────────────────────────┘
+```
+
+### Data Flow
+
+```
+EC2 Instance (CloudWatch Agent)
+    ↓
+    Collects: CPU, Memory, Disk, Network metrics
+    ↓
+CloudWatch Metrics (EC2/Monitoring namespace)
+    ↓
+CloudWatch Alarms (evaluate every 1-5 minutes)
+    ↓
+Threshold Breach → ALARM State
+    ↓
+SNS Topic (Publish to subscribers)
+    ↓
+Email / SMS Notification (within 1 minute)
+```
+
+---
+
+## Step-by-Step Deployment
+
+### Phase 1: Preparation (5 minutes)
+
+#### 1.1 Clone/Download Repository
+```bash
+# Create project directory
+mkdir -p sc-ec2-monitoring
+cd sc-ec2-monitoring
+
+# Save the three files in this directory:
+# - ec2-product-template.yaml (CloudFormation template)
+# - setup-service-catalog.sh (Setup script)
+# - deployment-guide.md (This file)
+```
+
+#### 1.2 Verify AWS Credentials
+```bash
+aws sts get-caller-identity
+# Output should show your Account ID, UserId, and ARN
+
+export AWS_REGION=us-east-1  # Change as needed
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+echo "Region: $AWS_REGION"
+echo "Account: $AWS_ACCOUNT_ID"
+```
+
+#### 1.3 Verify Existing Resources
+```bash
+# List VPCs
+aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId,CidrBlock]' --output table
+
+# List Subnets
+aws ec2 describe-subnets --query 'Subnets[*].[SubnetId,VpcId,CidrBlock]' --output table
+
+# List Security Groups
+aws ec2 describe-security-groups --query 'SecurityGroups[*].[GroupId,GroupName]' --output table
+
+# List Key Pairs
+aws ec2 describe-key-pairs --query 'KeyPairs[*].KeyName' --output table
+```
+
+**Make note of:**
+- VPC ID (e.g., vpc-12345678)
+- Subnet ID (e.g., subnet-87654321)
+- Security Group ID (e.g., sg-11111111)
+- Key Pair Name (e.g., my-key-pair)
+
+---
+
+### Phase 2: Initial Setup (10 minutes)
+
+#### 2.1 Make Setup Script Executable
+```bash
+chmod +x setup-service-catalog.sh
+```
+
+#### 2.2 Run Setup Script
+```bash
+./setup-service-catalog.sh
+
+# Output will show:
+# Portfolio ID:     port-xxxxxxxxxxxxx
+# Product ID:       prod-xxxxxxxxxxxxx
+# SNS Topic ARN:    arn:aws:sns:us-east-1:123456789:sc-ec2-alarms-123456789
+```
+
+#### 2.3 Subscribe to SNS Topic
+```bash
+# Replace with your email
+SNS_TOPIC_ARN="arn:aws:sns:us-east-1:123456789:sc-ec2-alarms-123456789"
+YOUR_EMAIL="yourname@company.com"
+
+aws sns subscribe \
+  --topic-arn $SNS_TOPIC_ARN \
+  --protocol email \
+  --notification-endpoint $YOUR_EMAIL
+
+# Check AWS Email - you'll receive confirmation request
+# Click confirmation link in email
+```
+
+#### 2.4 Grant User Access
+```bash
+# Replace with your IAM role/user ARN
+PORTFOLIO_ID="port-xxxxxxxxxxxxx"
+PRINCIPAL_ARN="arn:aws:iam::123456789:role/DeveloperRole"
+
+aws servicecatalog associate-principal-with-portfolio \
+  --portfolio-id $PORTFOLIO_ID \
+  --principal-arn $PRINCIPAL_ARN \
+  --principal-type IAM
+```
+
+---
+
+### Phase 3: First Launch (15 minutes)
+
+#### 3.1 Access Service Catalog Console
+```
+AWS Console → Service Catalog → Products → "EC2 with Monitoring"
+```
+
+#### 3.2 Click "Launch Product"
+
+#### 3.3 Fill in Parameters
+
+**Example Configuration:**
+
+```
+Instance Configuration:
+  Instance Name:       prod-web-server
+  Instance Type:       t3.medium
+  EBS Volume Size:     100 GB
+  EBS Volume Type:     gp3
+  Key Pair:            my-key-pair
+
+Network Configuration:
+  VPC:                 vpc-12345678
+  Subnet:              subnet-87654321
+  Security Group:      sg-11111111
+
+Monitoring Configuration:
+  SNS Topic ARN:       arn:aws:sns:region:account:sc-ec2-alarms-xxxxx
+  CPU Threshold:       80 (%)
+  Memory Threshold:    85 (%)
+  Disk Threshold:      80 (%)
+  Enable Auto-Recovery: true
+
+Tagging:
+  Environment:         production
+  Cost Center:         engineering
+```
+
+#### 3.4 Review and Launch
+- Review all parameters
+- Accept terms
+- Click "Launch Product"
+- Wait 2-5 minutes for CloudFormation to complete
+
+#### 3.5 Monitor Stack Creation
+```bash
+# In AWS Console: CloudFormation → Stacks
+# Wait for status: CREATE_COMPLETE
+
+# Or via CLI:
+aws cloudformation describe-stacks \
+  --stack-name sc-prod-web-server \
+  --query 'Stacks[0].StackStatus'
+```
+
+---
+
+### Phase 4: Validation (5 minutes)
+
+#### 4.1 Verify EC2 Instance
+```bash
+# Get Instance ID from CloudFormation Outputs
+INSTANCE_ID="i-1234567890abcdef0"
+
+aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PrivateIpAddress]'
+
+# Should show: running
+```
+
+#### 4.2 Verify CloudWatch Agent
+```bash
+# SSH into instance
+ssh -i my-key-pair.pem ec2-user@<instance-ip>
+
+# Check CloudWatch Agent status
+sudo systemctl status amazon-cloudwatch-agent
+
+# Should show: active (running)
+
+# View agent logs
+tail -f /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+```
+
+#### 4.3 Verify CloudWatch Metrics
+```bash
+# Wait 2-3 minutes for metrics to appear
+
+# List available metrics
+aws cloudwatch list-metrics \
+  --namespace EC2/Monitoring \
+  --query 'Metrics[*].MetricName' \
+  --output table
+
+# Should show: CPU_IDLE, MEM_USED_PERCENT, DISK_USED_PERCENT, etc.
+```
+
+#### 4.4 Verify Alarms Created
+```bash
+# List alarms for instance
+INSTANCE_ID="i-1234567890abcdef0"
+
+aws cloudwatch describe-alarms \
+  --query "Alarms[?contains(AlarmName, '${INSTANCE_ID}')].[AlarmName,StateValue]" \
+  --output table
+
+# Should show multiple alarms in OK state
+```
+
+---
+
+## Testing & Validation
+
+### Test 1: Generate High CPU Load
+```bash
+# SSH into instance
+ssh -i my-key-pair.pem ec2-user@<instance-ip>
+
+# Install stress tool
+sudo yum install -y stress
+
+# Generate CPU load (5 minutes)
+stress --cpu 4 --timeout 5m
+
+# Monitor in CloudWatch Console
+# Should see CPU spike to 80%+ 
+# Alert should trigger within 5 minutes
+# Email notification should arrive
+```
+
+### Test 2: Fill Disk Space
+```bash
+# SSH into instance
+ssh -i my-key-pair.pem ec2-user@<instance-ip>
+
+# Fill disk
+dd if=/dev/zero of=/tmp/large-file bs=1M count=30000
+
+# Monitor in CloudWatch
+# Should see disk usage > 80%
+# Alert should trigger within 1 minute
+
+# Clean up
+rm /tmp/large-file
+```
+
+### Test 3: Force Status Check Failure
+```bash
+# This is harder to test without instance store disruption
+# Alternatively, manually test alarm via AWS CLI:
+
+aws cloudwatch set-alarm-state \
+  --alarm-name prod-web-server-status-check-failed-instance \
+  --state-value ALARM \
+  --state-reason "Testing alarm notification"
+
+# Should receive email notification immediately
+```
+
+### Test 4: View CloudWatch Dashboard
+```
+AWS Console → CloudWatch → Dashboards
+Search for your instance ID
+Should show real-time graphs for:
+- CPU Utilization
+- Memory Utilization  
+- Disk Usage
+- Network metrics
+```
+
+---
+
+## Troubleshooting
+
+### Issue: CloudWatch Agent Not Installed
+
+**Symptom:** Metrics not appearing in CloudWatch
+
+**Solution:**
+```bash
+# SSH into instance
+ssh -i my-key-pair.pem ec2-user@<instance-ip>
+
+# Check if agent is installed
+ls -la /opt/aws/amazon-cloudwatch-agent/
+
+# If not found, install manually
+wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+sudo rpm -U ./amazon-cloudwatch-agent.rpm
+
+# Create config
+sudo cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+{
+  "agent": {"metrics_collection_interval": 60},
+  "metrics": {
+    "namespace": "EC2/Monitoring",
+    "metrics_collected": {
+      "cpu": {"measurement": [{"name": "cpu_usage_idle", "rename": "CPU_IDLE"}]},
+      "mem": {"measurement": [{"name": "mem_used_percent", "rename": "MEM_USED_PERCENT"}]},
+      "disk": {"measurement": [{"name": "used_percent", "rename": "DISK_USED_PERCENT"}], "resources": ["*"]}
+    }
+  }
+}
+EOF
+
+# Start agent
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+```
+
+### Issue: SNS Not Receiving Emails
+
+**Symptom:** Alarms trigger but no emails received
+
+**Solution:**
+```bash
+# Verify SNS subscription
+aws sns list-subscriptions-by-topic \
+  --topic-arn arn:aws:sns:region:account:topic-name \
+  --query 'Subscriptions[*].[SubscriptionArn,Endpoint]'
+
+# Should show email address and subscription status "PendingConfirmation" or "Subscribed"
+
+# If PendingConfirmation:
+# - Check spam folder
+# - Confirm subscription manually
+# - May need to resend confirmation
+aws sns subscribe \
+  --topic-arn arn:aws:sns:region:account:topic-name \
+  --protocol email \
+  --notification-endpoint your-email@company.com
+
+# Test SNS directly
+aws sns publish \
+  --topic-arn arn:aws:sns:region:account:topic-name \
+  --subject "Test Alert" \
+  --message "This is a test notification"
+```
+
+### Issue: Alarms in "INSUFFICIENT_DATA" State
+
+**Symptom:** Alarms show orange/yellow status
+
+**Solution:**
+```bash
+# Wait 5-10 minutes for metrics to accumulate (need datapoints for evaluation)
+
+# Check if metrics are publishing
+aws cloudwatch get-metric-statistics \
+  --namespace EC2/Monitoring \
+  --metric-name MEM_USED_PERCENT \
+  --dimensions Name=InstanceId,Value=i-xxxxx \
+  --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 300 \
+  --statistics Average
+
+# If no datapoints, metrics not being published
+# Check CloudWatch Agent logs (see above)
+```
+
+### Issue: Cannot SSH to Instance
+
+**Symptom:** Connection timeout when trying SSH
+
+**Solution:**
+```bash
+# 1. Verify security group allows SSH (port 22)
+aws ec2 describe-security-groups \
+  --group-ids sg-xxxxx \
+  --query 'SecurityGroups[0].IpPermissions'
+
+# Should show: IpProtocol=tcp, FromPort=22, ToPort=22
+
+# 2. Verify instance has public IP (if needed)
+aws ec2 describe-instances \
+  --instance-ids i-xxxxx \
+  --query 'Reservations[0].Instances[0].PublicIpAddress'
+
+# 3. Use Systems Manager Session Manager (no SSH needed)
+aws ssm start-session --target i-xxxxx
+
+# 4. Check instance status
+aws ec2 describe-instance-status --instance-ids i-xxxxx
+```
+
+---
+
+## Advanced Configuration
+
+### A1: Custom Metrics
+
+Send custom metrics from your application:
+
+```python
+import boto3
+
+cloudwatch = boto3.client('cloudwatch')
+
+# Publish custom metric
+cloudwatch.put_metric_data(
+    Namespace='EC2/Monitoring',
+    MetricData=[
+        {
+            'MetricName': 'ApplicationRequests',
+            'Value': 1500,
+            'Unit': 'Count',
+            'Dimensions': [
+                {'Name': 'InstanceId', 'Value': 'i-1234567890abcdef0'},
+                {'Name': 'Environment', 'Value': 'production'}
+            ]
+        }
+    ]
+)
+```
+
+### A2: Composite Alarms
+
+Alert when BOTH CPU and Memory are high:
+
+```bash
+aws cloudwatch put-composite-alarm \
+  --alarm-name "prod-server-resource-pressure" \
+  --alarm-description "Alert when both CPU and Memory are high" \
+  --alarm-actions arn:aws:sns:region:account:topic \
+  --alarm-rule "ALARM(prod-web-server-cpu-high) AND ALARM(prod-web-server-memory-high)"
+```
+
+### A3: Lambda Auto-Remediation
+
+Automatically restart instance on status check failure:
+
+```python
+import boto3
+import json
+
+ec2 = boto3.client('ec2')
+
+def lambda_handler(event, context):
+    # Parse SNS message
+    message = json.loads(event['Records'][0]['Sns']['Message'])
+    
+    # Extract instance ID from alarm
+    instance_id = message['Trigger']['Dimensions'][0]['value']
+    
+    # Reboot instance
+    ec2.reboot_instances(InstanceIds=[instance_id])
+    
+    return {'statusCode': 200, 'body': f'Rebooted {instance_id}'}
+```
+
+### A4: Slack Integration
+
+Send alerts to Slack instead of email:
+
+```bash
+# 1. Create Slack webhook URL in Slack app settings
+
+# 2. Create Lambda function to post to Slack
+# 3. Add Lambda as SNS subscriber
+
+aws sns subscribe \
+  --topic-arn arn:aws:sns:region:account:topic \
+  --protocol lambda \
+  --notification-endpoint arn:aws:lambda:region:account:function:slack-notifier
+```
+
+### A5: Cost Monitoring
+
+Track EC2 spending:
+
+```bash
+# Create cost anomaly alarm
+aws ce create-anomaly-monitor \
+  --anomaly-monitor \
+    MonitorName=EC2-Spending,\
+    MonitorType=DIMENSIONAL,\
+    MonitorDimension=SERVICE,\
+    MonitorSpecification='{"Service":"EC2"}'
+
+aws ce create-anomaly-subscription \
+  --subscription \
+    SubscriptionName=EC2-Alerts,\
+    Threshold=100,\
+    Frequency=DAILY,\
+    MonitorArnList=[arn:aws:ce:region:account:anomalymonitor/xxxxx]
+```
+
+---
+
+## Cost Optimization
+
+### Monthly Cost Breakdown (us-east-1)
+
+| Component | Price | Notes |
+|-----------|-------|-------|
+| EC2 t3.medium | ~$30 | On-demand, Linux |
+| CloudWatch Metrics (10 custom) | ~$0.30 | $0.03/metric/month |
+| CloudWatch Logs | ~$0.50 | $0.50/GB ingestion |
+| SNS Notifications | ~$0.50 | ~100 emails @ $0.005 each |
+| **Total** | **~$31.30** | Per instance |
+
+### Cost Reduction Strategies
+
+1. **Use Savings Plans** (~30% discount)
+   ```bash
+   # Convert to 1-year Savings Plans
+   ```
+
+2. **Adjust Alarm Thresholds**
+   - Reduce false alarms = fewer SNS messages
+   - Increase collection period (60s → 300s)
+
+3. **Set Log Retention**
+   ```bash
+   aws logs put-retention-policy \
+     --log-group-name /aws/ec2/prod-server/system \
+     --retention-in-days 7  # Reduce from default 30
+   ```
+
+4. **Use Spot Instances** (~70% discount)
+   - Add parameter for Spot vs On-Demand
+
+5. **Aggregate Instances**
+   - Use single dashboard for multiple instances
+   - Reduce metric namespace pollution
+
+---
+
+## Support & Resources
+
+### Documentation
+- [AWS Service Catalog](https://docs.aws.amazon.com/servicecatalog/)
+- [CloudWatch Monitoring](https://docs.aws.amazon.com/AmazonCloudWatch/)
+- [EC2 Best Practices](https://docs.aws.amazon.com/AWSEC2/)
+- [SNS for Notifications](https://docs.aws.amazon.com/sns/)
+
+### Useful Commands
+
+```bash
+# List all Service Catalog products
+aws servicecatalog search-products-as-admin
+
+# Get product details
+aws servicecatalog describe-product \
+  --product-id prod-xxxxxxxxxxxxx
+
+# List provisioned products
+aws servicecatalog list-provisioned-products
+
+# Update product version
+aws servicecatalog create-provisioning-artifact \
+  --product-id prod-xxxxx \
+  --parameters TemplateUrl=s3://bucket/new-template.yaml
+
+# Terminate instance (destroy CloudFormation stack)
+aws cloudformation delete-stack --stack-name stack-name
+```
+
+### Monitoring Dashboard URL
+
+```
+https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:
+```
+
+---
+
+## Next Steps
+
+1. **Customize Thresholds**: Fine-tune based on your application baseline
+2. **Create Dashboard**: Build team-specific CloudWatch dashboards
+3. **Add More Products**: Create similar for RDS, Lambda, ECS
+4. **Implement Automation**: Add Lambda for auto-remediation
+5. **Scale Deployment**: Multi-region Service Catalogs
+6. **Governance**: Implement FinOps policies and cost controls
+
+---
+
+## Feedback & Improvements
+
+This template is meant to be extended. Consider:
+
+- [ ] Adding Application Load Balancer
+- [ ] Adding Auto Scaling Group
+- [ ] Adding RDS Database
+- [ ] Adding Container Support (ECS/EKS)
+- [ ] Adding Cost Optimization Options
+- [ ] Adding Backup/Snapshot Policies
+- [ ] Adding Security Hardening
+- [ ] Adding Compliance Monitoring
+
+---
+
+**Last Updated**: November 2025
+**Version**: 1.0
+**Maintainer**: Your Organization

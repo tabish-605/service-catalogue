@@ -1,0 +1,353 @@
+# AWS Service Catalog EC2 Product with Comprehensive Monitoring
+## Complete End-to-End Solution
+
+This solution provides a production-ready AWS Service Catalog product that launches EC2 instances with integrated CloudWatch monitoring, alarms, and SNS notifications.
+
+---
+
+## Solution Architecture
+
+```
+User → Service Catalog → CloudFormation Template
+                            ↓
+                        EC2 Instance
+                        + IAM Role
+                        + CloudWatch Agent
+                        + Security Group
+                            ↓
+                    CloudWatch Metrics
+                    (CPU, Memory, Disk, Status)
+                            ↓
+                    CloudWatch Alarms
+                            ↓
+                        SNS Topic
+                            ↓
+                    Email Notifications
+```
+
+---
+
+## Components
+
+### 1. **Service Catalog Portfolio Setup (One-time)**
+
+```bash
+# Create SNS Topic for Service Catalog notifications
+aws sns create-topic --name sc-ec2-notifications
+
+# Create S3 bucket for CloudFormation templates
+aws s3 mb s3://my-org-sc-templates-$(date +%s)
+```
+
+### 2. **IAM Roles & Policies**
+
+The template creates:
+- **EC2 Instance IAM Role**: Allows instance to write metrics to CloudWatch
+- **Service Catalog Launch Role**: Allows Service Catalog to create resources
+
+### 3. **CloudWatch Agent Installation & Configuration**
+
+Installed via Systems Manager on EC2 launch with SSM document that configures:
+- CPU utilization
+- Memory utilization (RAM)
+- Disk usage (root and data volumes)
+- Network metrics
+- Log collection
+
+### 4. **Monitoring Alarms (Production-Ready)**
+
+**CPU Utilization**
+- Threshold: 80% average over 5 minutes
+- Action: Send SNS notification, log to CloudWatch
+
+**Memory Utilization**
+- Threshold: 85% average over 5 minutes
+- Action: Send SNS notification
+
+**Disk Usage**
+- Root Volume: Alert when > 80% used
+- Additional: Alert when > 90% used
+- Action: Send SNS notification
+
+**Status Checks**
+- Instance status check: Failed
+- System status check: Failed
+- Action: Send SNS notification immediately
+
+**Network Metrics**
+- High packet loss (> 1%)
+- Network errors threshold
+- Action: SNS notification
+
+---
+
+## Files Included
+
+1. **ec2-product-template.yaml** - Main CloudFormation template
+2. **cloudwatch-agent-config.json** - CloudWatch Agent configuration
+3. **setup-service-catalog.sh** - Script to create portfolio and product
+4. **deployment-guide.md** - Step-by-step deployment instructions
+
+---
+
+## Key Features
+
+✅ **Parameterized for Flexibility**
+- Instance type, VPC, Subnet, Key pair, Security group
+- Alarm thresholds customizable
+- Email notifications configurable
+
+✅ **Production-Ready**
+- Comprehensive monitoring out-of-box
+- Role-based access control
+- Tagging strategy for cost allocation
+- CloudWatch Logs integration
+
+✅ **Security**
+- IAM least privilege
+- Encryption options for EBS
+- Security group parameters
+- Instance metadata service v2 enforced
+
+✅ **Cost Optimization**
+- Configurable EBS volume types
+- Right-sizing via instance type parameter
+- Automatic resource tagging
+- CloudWatch cost monitoring
+
+✅ **Observability**
+- CPU, Memory, Disk utilization tracking
+- Status checks monitoring
+- Custom namespace (EC2/Monitoring)
+- Centralized SNS delivery
+
+---
+
+## Quick Start
+
+### Step 1: Prepare SNS Topic
+```bash
+aws sns create-topic --name prod-ec2-alarms
+aws sns subscribe \
+  --topic-arn arn:aws:sns:us-east-1:ACCOUNT:prod-ec2-alarms \
+  --protocol email \
+  --notification-endpoint your-email@company.com
+```
+
+### Step 2: Create Service Catalog Portfolio
+```bash
+# Execute the setup script
+./setup-service-catalog.sh \
+  --portfolio-name "Infrastructure Services" \
+  --product-name "EC2 with Monitoring" \
+  --sns-topic "arn:aws:sns:us-east-1:ACCOUNT:prod-ec2-alarms"
+```
+
+### Step 3: Grant User Access
+```bash
+aws servicecatalog associate-principal-with-portfolio \
+  --portfolio-id port-xxxxx \
+  --principal-arn arn:aws:iam::ACCOUNT:role/DeveloperRole \
+  --principal-type IAM
+```
+
+### Step 4: Users Launch Product
+- Navigate to AWS Service Catalog console
+- Select "EC2 with Monitoring" product
+- Provide parameters (instance type, VPC, subnet, etc.)
+- Launch
+- Instance provisions with all monitoring configured
+
+---
+
+## Parameter Reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| InstanceType | String | t3.medium | EC2 instance type |
+| InstanceName | String | prod-app-server | Instance name tag |
+| VpcId | AWS::EC2::VPC::Id | - | VPC for instance |
+| SubnetId | AWS::EC2::Subnet::Id | - | Subnet for instance |
+| KeyName | AWS::EC2::KeyPair::KeyName | - | EC2 Key pair |
+| SecurityGroupId | AWS::EC2::SecurityGroup::Id | - | Security group |
+| EbsVolumeSize | Number | 100 | Root volume size (GB) |
+| EbsVolumeType | String | gp3 | EBS volume type |
+| EnvironmentTag | String | production | Environment tag |
+| CostCenter | String | engineering | Cost center tag |
+| SNSTopicArn | String | - | SNS topic for alarms |
+| CpuAlarmThreshold | Number | 80 | CPU threshold (%) |
+| MemoryAlarmThreshold | Number | 85 | Memory threshold (%) |
+| DiskAlarmThreshold | Number | 80 | Disk threshold (%) |
+
+---
+
+## Alarm Thresholds (Production)
+
+| Metric | Threshold | Duration | Action |
+|--------|-----------|----------|--------|
+| CPU Utilization | 80% | 5 min avg | SNS + CloudWatch |
+| Memory Utilization | 85% | 5 min avg | SNS + CloudWatch |
+| Disk Usage (Root) | 80% | 1 min | SNS + Log |
+| Disk Usage (Additional) | 90% | 1 min | SNS + Log |
+| Status Check Failed | Any | 1 min | SNS + Alert |
+| Network Errors | > threshold | 5 min | SNS + Log |
+| Packet Loss | > 1% | 5 min | SNS + Alert |
+
+---
+
+## Monitoring Dashboard
+
+After provisioning, access CloudWatch Dashboard:
+```bash
+# View metrics in CloudWatch
+aws cloudwatch list-metrics --namespace EC2/Monitoring --query 'Metrics[].MetricName'
+```
+
+Dashboard includes:
+- Real-time CPU, Memory, Disk graphs
+- Alarm history
+- Status check results
+- Network performance
+- Custom metric trends
+
+---
+
+## SNS Message Example
+
+```
+AWS CloudWatch Alarm Notification
+
+Alarm Name: my-prod-server-cpu-high
+New State: ALARM
+State Change Reason: Threshold Crossed
+
+Alarm Details:
+- Instance ID: i-1234567890abcdef0
+- Metric: CPUUtilization
+- Current Value: 92.3%
+- Threshold: 80%
+- Period: 5 minutes
+- Datapoints: 1 datapoint in alarm state
+
+Instance: prod-app-server
+Environment: production
+Cost Center: engineering
+
+Take Action:
+1. SSH into instance and investigate processes
+2. Scale horizontally if persistent
+3. Review application logs in CloudWatch Logs
+4. Update thresholds if normal baseline
+```
+
+---
+
+## Advanced Features
+
+### 1. **Auto-Recovery**
+Instance reboot if system status check fails (configurable)
+
+### 2. **Composite Alarms**
+Alert when multiple metrics are in alarm state simultaneously
+
+### 3. **Log Integration**
+All CloudWatch Logs sent to central log group with retention policy
+
+### 4. **Custom Metrics**
+Application can publish custom metrics to same namespace
+
+### 5. **Cost Anomaly Detection**
+Track EC2 costs and alert on unusual spending patterns
+
+### 6. **Automated Response**
+Lambda can be triggered on alarm to:
+- Execute remediation scripts
+- Scale resources
+- Notify on-call engineer via PagerDuty/OpsGenie
+
+---
+
+## Troubleshooting
+
+### CloudWatch Agent Not Sending Metrics
+
+```bash
+# Check agent status
+sudo systemctl status amazon-cloudwatch-agent
+
+# View agent logs
+tail -f /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+
+# Restart agent
+sudo systemctl restart amazon-cloudwatch-agent
+
+# Validate configuration
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -m ec2 \
+  -a validate-config \
+  -c ssm:configuration-parameter-name
+```
+
+### Alarms Not Triggering
+
+```bash
+# Check alarm state
+aws cloudwatch describe-alarms --alarm-names "my-instance-cpu-high"
+
+# View alarm history
+aws cloudwatch describe-alarm-history \
+  --alarm-name "my-instance-cpu-high" \
+  --max-records 20
+```
+
+### SNS Not Delivering
+
+```bash
+# Confirm SNS subscription
+aws sns list-subscriptions-by-topic --topic-arn arn:aws:sns:REGION:ACCOUNT:topic-name
+
+# Test SNS notification
+aws sns publish \
+  --topic-arn arn:aws:sns:REGION:ACCOUNT:topic-name \
+  --subject "Test Alert" \
+  --message "This is a test notification"
+```
+
+---
+
+## Cost Implications
+
+**Monthly Costs (Estimate for us-east-1)**
+
+- EC2 t3.medium: ~$30
+- CloudWatch Metrics: ~$0.30 (10 custom metrics @ $0.30/month)
+- CloudWatch Logs: ~$0.50 (1GB ingestion)
+- SNS: ~$0.50 (100 notifications)
+- **Total: ~$31.30/month per instance**
+
+### Cost Optimization Tips
+
+1. Use appropriate thresholds to reduce false alarms
+2. Aggregate logs with log groups
+3. Set retention policies on logs
+4. Use metric math to reduce metric count
+
+---
+
+## Next Steps
+
+1. **Customize Thresholds**: Adjust based on your application baseline
+2. **Create Dashboard**: Build custom CloudWatch dashboard for team
+3. **Automation**: Add Lambda for auto-remediation
+4. **Integration**: Connect SNS to PagerDuty/Slack
+5. **Scale**: Create similar products for RDS, ECS, etc.
+
+---
+
+## References
+
+- [AWS Service Catalog Guide](https://docs.aws.amazon.com/servicecatalog/)
+- [CloudWatch Monitoring](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/)
+- [CloudWatch Agent Configuration](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Install-CloudWatch-Agent.html)
+- [SNS Best Practices](https://docs.aws.amazon.com/sns/latest/dg/best-practices.html)
+- [EC2 Monitoring](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring_ec2.html)
